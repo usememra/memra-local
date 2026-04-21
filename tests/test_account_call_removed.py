@@ -1,0 +1,55 @@
+"""Phase 77-03: verify memra-local no longer calls phantom /account endpoint.
+
+The cloud API exposes no `/account` route. `check_account_tier` previously
+issued `GET {api_url}/account`, which always 404'd. This plan removes the
+call entirely and makes the method return None (fail-closed — `shared_raw`
+push already treats non-{team,admin} tiers as a hard block).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import patch
+
+import httpx
+import pytest
+
+import memra_local.services.sync_service as sync_module
+from memra_local.services.factory import create_service
+
+
+SYNC_SERVICE_PATH = Path(sync_module.__file__)
+
+
+@pytest.fixture
+def sync(tmp_path):
+    svc = create_service(scope="global", storage_dir=tmp_path)
+    svc.sync_service.enable("ns", api_key="memra_live_test")
+    return svc.sync_service
+
+
+class TestNoAccountCall:
+    def test_source_has_no_account_reference(self):
+        """sync_service.py must not reference the phantom /account endpoint."""
+        source = SYNC_SERVICE_PATH.read_text()
+        assert "/account" not in source, (
+            "sync_service.py still references /account — the cloud API has "
+            "no such endpoint. Remove the call."
+        )
+
+    def test_check_account_tier_makes_no_http_request(self, sync):
+        """check_account_tier must not issue any HTTP requests."""
+
+        def _explode(*args, **kwargs):
+            raise AssertionError(
+                f"check_account_tier issued HTTP call: args={args} kwargs={kwargs}"
+            )
+
+        with patch.object(httpx, "get", side_effect=_explode):
+            result = sync.check_account_tier("ns")
+
+        # Fail-closed: with no /account endpoint, tier is unknown → None.
+        assert result is None
+
+    def test_check_account_tier_returns_none_when_namespace_missing(self, sync):
+        assert sync.check_account_tier("not-enabled") is None

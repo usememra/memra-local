@@ -1,0 +1,52 @@
+[project]
+name = "memra-local"
+version = "0.2.2"
+description = "Local memory server for AI agents — offline, private, fast"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "BUSL-1.1"}
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.20.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "python-ulid>=2.0.0",
+    "click>=8.0",
+    "sentence-transformers>=5.0.0",
+    "numpy>=1.24.0",
+    "mcp[cli]>=1.27.0",
+]
+
+[project.urls]
+Homepage      = "https://usememra.com"
+Source        = "https://github.com/usememra/memra-local"
+Documentation = "https://usememra.com/install"
+Changelog     = "https://github.com/usememra/memra-local/releases"
+Issues        = "https://github.com/usememra/memra-local/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "httpx",
+    "mypy",
+    "ruff",
+]
+
+[project.scripts]
+memra = "memra_local.cli:cli"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "slow: long-running performance regression tests (run explicitly)",
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["memra_local*"]
+exclude = ["tests*"]

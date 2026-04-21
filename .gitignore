@@ -1,0 +1,4 @@
+memra_local.egg-info/
+dist/
+build/
+*.egg-info/
