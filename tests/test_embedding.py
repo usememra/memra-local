@@ -38,14 +38,14 @@ def sqlite_index(tmp_storage: Path) -> SQLiteIndex:
 
 class TestLazyLoading:
     def test_constructor_does_not_load_model(self) -> None:
-        """EmbeddingService() constructor should NOT import sentence_transformers."""
-        # Remove sentence_transformers from sys.modules if present so we can detect fresh import
-        was_loaded = "sentence_transformers" in sys.modules
+        """EmbeddingService() constructor should NOT import fastembed."""
+        # Remove fastembed from sys.modules if present so we can detect fresh import
+        was_loaded = "fastembed" in sys.modules
         svc = EmbeddingService()
         assert svc._model is None
         # If it wasn't loaded before construction, it shouldn't be loaded after
         if not was_loaded:
-            assert "sentence_transformers" not in sys.modules
+            assert "fastembed" not in sys.modules
 
     def test_model_loads_on_first_encode(self, embedding_service: EmbeddingService) -> None:
         """Model should load lazily on first encode() call."""

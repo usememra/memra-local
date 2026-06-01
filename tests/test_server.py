@@ -26,10 +26,12 @@ class TestCLIServeHelp:
         assert "--scope" in result.output
 
     def test_cli_version(self):
+        from memra_local import __version__
+
         runner = CliRunner()
         result = runner.invoke(cli, ["--version"])
         assert result.exit_code == 0
-        assert "0.2.0" in result.output
+        assert __version__ in result.output
 
 
 class TestCLIDefaultPort:

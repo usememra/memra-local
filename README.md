@@ -50,7 +50,7 @@ See [usememra.com/install](https://usememra.com/install) for client-specific sni
 
 - **Flat-file memory** in `~/.memra/` — plain YAML, inspectable, greppable, diff-able
 - **MCP server** exposing `memra_add`, `memra_recall`, `memra_get`, `memra_list`, `memra_supersede`, `memra_history`, and more
-- **Local embeddings** via `sentence-transformers` — no OpenAI key required
+- **Local embeddings** via `fastembed` (ONNX `all-MiniLM-L6-v2`) — no OpenAI key, no PyTorch
 - **Sync to cloud** optional: `memra sync enable <namespace> --api-key memra_live_...`
 
 ## Commands
