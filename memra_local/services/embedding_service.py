@@ -7,6 +7,9 @@ identical (verified) and L2-normalized, so cosine similarity stays a dot product
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -25,12 +28,22 @@ class EmbeddingService:
         self._model = None
 
     def _ensure_model(self) -> None:
-        """Load model on first use. Downloads if not cached (~90MB)."""
+        """Load model on first use. Downloads if not cached (~90MB).
+
+        Cache the ONNX model in a persistent dir. fastembed otherwise defaults
+        to a tempfile dir (/tmp/fastembed_cache) that is wiped on reboot, which
+        forces a full re-download before any embedding works and silently
+        degrades recall to FTS-only until it completes. Default to
+        ~/.cache/fastembed; honor FASTEMBED_CACHE_PATH for shared/custom caches.
+        """
         if self._model is not None:
             return
         from fastembed import TextEmbedding
 
-        self._model = TextEmbedding(model_name=self.MODEL_NAME)
+        cache_dir = os.environ.get(
+            "FASTEMBED_CACHE_PATH", str(Path.home() / ".cache" / "fastembed")
+        )
+        self._model = TextEmbedding(model_name=self.MODEL_NAME, cache_dir=cache_dir)
 
     def encode(self, text: str) -> NDArray[np.float32]:
         """Encode a single text to a 384-dim normalized float32 vector."""

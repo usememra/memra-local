@@ -8,6 +8,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+def _fts5_phrase(query: str) -> str:
+    """Escape a user query for safe use as an FTS5 MATCH phrase.
+
+    SQLite parameter binding escapes SQL injection but NOT FTS5 query
+    syntax — operators like ``-``, ``:``, ``*``, ``OR``, ``AND``, ``NEAR``
+    are interpreted by the FTS5 parser. Wrapping the query in phrase
+    quotes neutralizes them and treats the whole string as a literal
+    phrase. Internal ``"`` is escaped by doubling (FTS5 convention).
+    """
+    if not query or not query.strip():
+        return '""'
+    return '"' + query.replace('"', '""') + '"'
+
+
 class SQLiteIndex:
     """SQLite-backed memory index with WAL journaling and FTS5 full-text search."""
 
@@ -270,7 +284,7 @@ class SQLiteIndex:
             )
 
         where_clause = " AND ".join(conditions)
-        params.extend([query, limit, offset])
+        params.extend([_fts5_phrase(query), limit, offset])
 
         sql = f"""
             SELECT m.*, fts.rank

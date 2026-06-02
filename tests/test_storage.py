@@ -164,6 +164,51 @@ class TestSQLiteIndex:
         assert results[0]["id"] == "mem-010"
         idx.close()
 
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "simple",
+            "A3",
+            "MISSION-A3",
+            "foo-bar",
+            "MISSION-A3 bot registry",
+            'with "quotes"',
+            "col:value",
+            "-negation",
+            "wildcard*",
+            "a OR b",
+            "near NEAR you",
+            "",
+            "   ",
+        ],
+    )
+    def test_search_fts_handles_fts5_operator_chars(
+        self, tmp_storage: Path, query: str
+    ) -> None:
+        """FTS5 operators in user queries must not raise; the query is
+        treated as a literal phrase. Regression for hyphen/colon/etc bugs.
+        """
+        db_path = tmp_storage / "index.db"
+        idx = SQLiteIndex(db_path=db_path)
+        idx.initialize()
+        idx.insert(
+            memory_id="mem-fts-op",
+            namespace="default",
+            tenant_id="local",
+            type_="fact",
+            importance=5,
+            tags=[],
+            content_hash="hashop",
+            storage_path="default/mem-fts-op.yaml",
+            content="MISSION-A3 bot registry AI crawlers UA patterns",
+            source=None,
+            metadata=None,
+            created_at="2026-05-13T00:00:00Z",
+            updated_at="2026-05-13T00:00:00Z",
+        )
+        idx.search_fts(query, namespace="default", tenant_id="local")
+        idx.close()
+
     def test_sqlite_dedup(self, tmp_storage: Path) -> None:
         db_path = tmp_storage / "index.db"
         idx = SQLiteIndex(db_path=db_path)
