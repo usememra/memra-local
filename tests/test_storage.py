@@ -124,6 +124,52 @@ class TestSQLiteIndex:
         assert rows[0]["id"] == "mem-001"
         idx.close()
 
+    def test_list_memories_include_superseded_no_filters(self, tmp_storage: Path) -> None:
+        """include_superseded=True with no other filters must not build a bare
+        'WHERE ' clause (regression: empty conditions raised OperationalError)."""
+        db_path = tmp_storage / "index.db"
+        idx = SQLiteIndex(db_path=db_path)
+        idx.initialize()
+        now = "2026-04-08T00:00:00Z"
+        idx.insert(
+            memory_id="mem-old",
+            namespace="default",
+            tenant_id="local",
+            type_="fact",
+            importance=5,
+            tags=[],
+            content_hash="hash-old",
+            storage_path="default/mem-old.yaml",
+            content="old version",
+            source=None,
+            metadata=None,
+            created_at=now,
+            updated_at=now,
+        )
+        idx.insert(
+            memory_id="mem-new",
+            namespace="default",
+            tenant_id="local",
+            type_="fact",
+            importance=5,
+            tags=[],
+            content_hash="hash-new",
+            storage_path="default/mem-new.yaml",
+            content="new version",
+            source=None,
+            metadata=None,
+            created_at=now,
+            updated_at=now,
+        )
+        assert idx.supersede_by_id("mem-old", "mem-new", expected_revision=1) == 1
+
+        rows, total = idx.list_memories(include_superseded=True)
+        assert total == 2
+        statuses = {r["id"]: r["status"] for r in rows}
+        assert statuses["mem-old"] == "superseded"
+        assert statuses["mem-new"] == "active"
+        idx.close()
+
     def test_sqlite_fts5_search(self, tmp_storage: Path) -> None:
         db_path = tmp_storage / "index.db"
         idx = SQLiteIndex(db_path=db_path)

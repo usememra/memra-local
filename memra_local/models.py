@@ -210,6 +210,7 @@ class SyncPullResult(BaseModel):
     """Result of a pull operation."""
 
     applied: int
+    skipped: int = 0  # update/delete events whose target was not found locally
     cursor: int
     has_more: bool
     error: str | None = None

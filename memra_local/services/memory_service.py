@@ -36,6 +36,7 @@ class MemoryService:
         self.index = index
         self.embedding_service = embedding_service
         self.sync_service = sync_service
+        self._semantic_fallback_logged = False
 
     # ------------------------------------------------------------------
     # Add
@@ -45,7 +46,9 @@ class MemoryService:
 
         Args:
             request: Dict with content, tenant_id, project_id, type,
-                     importance, tags, source, metadata.
+                     importance, tags, source, metadata. An optional "id"
+                     overrides the generated ULID (used by sync pull to
+                     preserve remote memory ids).
 
         Returns:
             (memory_data, is_duplicate) -- is_duplicate=True means existing returned.
@@ -68,7 +71,7 @@ class MemoryService:
                 self.index.delete_by_id(existing["id"])
 
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        memory_id = f"mem_{ULID()}"
+        memory_id = request.get("id") or f"mem_{ULID()}"
 
         memory_data = {
             "id": memory_id,
@@ -233,11 +236,9 @@ class MemoryService:
 
         file_data["updated_at"] = now
 
-        # Write flat file atomically
-        namespace = existing["namespace"]
-        self.store.write(namespace, memory_id, file_data)
-
-        # Update index (with or without optimistic locking)
+        # Update index FIRST (with or without optimistic locking) — the index
+        # enforces dedup and revision checks, so a rejected update must leave
+        # the flat file untouched (otherwise file and index drift apart).
         if expected_revision is not None:
             rowcount = self.index.update_by_id_locked(
                 memory_id, index_updates, expected_revision
@@ -247,16 +248,21 @@ class MemoryService:
         else:
             self.index.update_by_id(memory_id, index_updates)
 
+        # Write flat file atomically (only after the index accepted the update)
+        namespace = existing["namespace"]
+        self.store.write(namespace, memory_id, file_data)
+
         # Update FTS content if content changed
         if "content" in updates:
-            self.index._c.execute(
-                "DELETE FROM memories_fts WHERE id = ?", (memory_id,)
-            )
-            self.index._c.execute(
-                "INSERT INTO memories_fts (id, content) VALUES (?, ?)",
-                (memory_id, updates["content"]),
-            )
-            self.index._c.commit()
+            with self.index._lock:
+                self.index._c.execute(
+                    "DELETE FROM memories_fts WHERE id = ?", (memory_id,)
+                )
+                self.index._c.execute(
+                    "INSERT INTO memories_fts (id, content) VALUES (?, ?)",
+                    (memory_id, updates["content"]),
+                )
+                self.index._c.commit()
 
             # Re-generate embedding for updated content
             if self.embedding_service is not None:
@@ -474,15 +480,25 @@ class MemoryService:
         """
         # Try semantic search first
         if self.embedding_service is not None:
-            candidates = self.index.get_candidates_with_embeddings(
-                namespace=namespace,
-                tenant_id=tenant_id,
-                type_=type_,
-                importance_min=importance_min,
-                include_proposed=include_proposed,
-            )
-            if candidates:
-                return self._recall_semantic(query, candidates, limit)
+            try:
+                candidates = self.index.get_candidates_with_embeddings(
+                    namespace=namespace,
+                    tenant_id=tenant_id,
+                    type_=type_,
+                    importance_min=importance_min,
+                    include_proposed=include_proposed,
+                )
+                if candidates:
+                    return self._recall_semantic(query, candidates, limit)
+            except Exception as exc:
+                # Embedding/model failure (e.g. fastembed cache wiped while
+                # offline) must not break recall — degrade to FTS. Log once.
+                if not self._semantic_fallback_logged:
+                    logger.warning(
+                        "Semantic recall unavailable (%s); falling back to FTS text-match.",
+                        exc,
+                    )
+                    self._semantic_fallback_logged = True
 
         # Fallback to FTS5 text-match
         return self._recall_fts(
@@ -627,16 +643,15 @@ class MemoryService:
         the cloud is the source of truth for shared/promoted memories. Cloud
         failures degrade silently to local-only (warning logged).
         """
-        # Query index ordered by importance DESC, then created_at DESC
+        # Query index ordered by importance DESC, then created_at DESC, so
+        # the LIMIT keeps the most important rows (not just the newest).
         rows, _ = self.index.list_memories(
             namespace=namespace,
             tenant_id=tenant_id,
             limit=limit,
             offset=0,
+            order_by_importance=True,
         )
-
-        # Sort by importance DESC (list_memories sorts by created_at DESC)
-        rows.sort(key=lambda r: r.get("importance", 5), reverse=True)
 
         local_results: list[dict] = []
         for row in rows:

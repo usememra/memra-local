@@ -1,9 +1,10 @@
-"""Phase 77-03: verify memra-local no longer calls phantom /account endpoint.
+"""Verify check_account_tier never calls the phantom /account endpoint.
 
 The cloud API exposes no `/account` route. `check_account_tier` previously
-issued `GET {api_url}/account`, which always 404'd. This plan removes the
-call entirely and makes the method return None (fail-closed — `shared_raw`
-push already treats non-{team,admin} tiers as a hard block).
+issued `GET {api_url}/account`, which always 404'd. It now reads tier from
+`GET /usage` (the real route), staying fail-closed on any error. This file
+guards against the /account regression; the positive /usage behaviour is
+covered in test_sync.py::TestCheckAccountTier.
 """
 
 from __future__ import annotations
@@ -37,19 +38,20 @@ class TestNoAccountCall:
             "no such endpoint. Remove the call."
         )
 
-    def test_check_account_tier_makes_no_http_request(self, sync):
-        """check_account_tier must not issue any HTTP requests."""
+    def test_check_account_tier_queries_usage_not_account(self, sync):
+        """The tier lookup must hit /usage, never the phantom /account."""
+        captured = {}
 
-        def _explode(*args, **kwargs):
-            raise AssertionError(
-                f"check_account_tier issued HTTP call: args={args} kwargs={kwargs}"
-            )
+        def _capture(url, *args, **kwargs):
+            captured["url"] = url
+            raise httpx.ConnectError("blocked")  # fail-closed, no real network
 
-        with patch.object(httpx, "get", side_effect=_explode):
+        with patch.object(httpx, "get", side_effect=_capture):
             result = sync.check_account_tier("ns")
 
-        # Fail-closed: with no /account endpoint, tier is unknown → None.
-        assert result is None
+        assert "/usage" in captured["url"]
+        assert "/account" not in captured["url"]
+        assert result is None  # fail-closed on the connect error
 
     def test_check_account_tier_returns_none_when_namespace_missing(self, sync):
         assert sync.check_account_tier("not-enabled") is None

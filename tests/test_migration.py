@@ -72,6 +72,7 @@ class TestMigration:
             result = migration.migrate(
                 index=populated_svc.index,
                 store=populated_svc.store,
+                project_id="proj_test",
             )
 
         assert result.total == 5
@@ -108,7 +109,7 @@ class TestMigration:
             return _mock_batch_response(count)
 
         with patch("httpx.post", side_effect=side_effect) as mock_post:
-            result = migration.migrate(index=svc.index, store=svc.store)
+            result = migration.migrate(index=svc.index, store=svc.store, project_id="proj_test")
 
         assert mock_post.call_count == 3  # 50 + 50 + 20
         assert result.migrated == 120
@@ -136,6 +137,7 @@ class TestMigrationPii:
             result = migration.migrate(
                 index=populated_svc.index,
                 store=populated_svc.store,
+                project_id="proj_test",
             )
 
         assert result.migrated == 5
@@ -160,6 +162,7 @@ class TestMigrationPii:
             result = migration.migrate(
                 index=populated_svc.index,
                 store=populated_svc.store,
+                project_id="proj_test",
             )
 
         assert result.failed == 5
@@ -182,6 +185,7 @@ class TestMigrationIdempotent:
             result = migration.migrate(
                 index=populated_svc.index,
                 store=populated_svc.store,
+                project_id="proj_test",
             )
 
         assert result.migrated == 2
@@ -204,6 +208,7 @@ class TestMigrationDryRun:
             result = migration.migrate(
                 index=populated_svc.index,
                 store=populated_svc.store,
+                project_id="proj_test",
                 dry_run=True,
             )
 
@@ -246,7 +251,7 @@ class TestMigrationPartialFailure:
             return _mock_batch_response(count)
 
         with patch("httpx.post", side_effect=side_effect):
-            result = migration.migrate(index=svc.index, store=svc.store)
+            result = migration.migrate(index=svc.index, store=svc.store, project_id="proj_test")
 
         # 75 memories = batch 1 (50) + batch 2 (25). Batch 2 fails.
         assert result.migrated == 50
@@ -275,6 +280,7 @@ class TestMigrationProgress:
             result = migration.migrate(
                 index=populated_svc.index,
                 store=populated_svc.store,
+                project_id="proj_test",
                 progress_callback=on_progress,
             )
 
@@ -305,3 +311,75 @@ class TestMigrateResult:
         r = MigrateResult(total=10, migrated=10, skipped=0, failed=0)
         assert r.errors == []
         assert r.dry_run is False
+
+
+# -------------------------------------------------------------------
+# Cloud batch contract (regression: 422 + silent-207)
+# -------------------------------------------------------------------
+
+class TestMigrationCloudContract:
+    def test_payload_carries_tenant_id_and_target_project(self, populated_svc):
+        """Each memory must send tenant_id (=namespace) and the target project_id.
+
+        Regression for the 422 'tenant id required' / 'project not found': the
+        cloud batch endpoint requires both per memory, and project_id must be a
+        real cloud project, not the local namespace.
+        """
+        migration = MigrationService(
+            api_url="https://example.com/api/v1",
+            api_key="memra_live_test123",
+        )
+
+        with patch("httpx.post", return_value=_mock_batch_response(5)) as mock_post:
+            migration.migrate(
+                index=populated_svc.index,
+                store=populated_svc.store,
+                project_id="proj_target_abc",
+            )
+
+        sent = mock_post.call_args.kwargs["json"]["memories"]
+        assert sent, "no memories sent"
+        for m in sent:
+            assert m["project_id"] == "proj_target_abc"
+            assert m["tenant_id"] == "test-ns"  # local namespace preserved
+
+    def test_207_per_item_failures_are_counted_not_swallowed(self, populated_svc):
+        """A 207 with per-item errors must increment failed and surface a message.
+
+        raise_for_status() does not raise on 207, so without explicit handling
+        the failures vanish as a silent '0 migrated'.
+        """
+        resp = MagicMock()
+        resp.status_code = 207
+        resp.json.return_value = {
+            "total": 5,
+            "created": 2,
+            "duplicates": 0,
+            "errors": 3,
+            "results": [
+                {"index": 0, "status": "created"},
+                {"index": 1, "status": "created"},
+                {"index": 2, "status": "error",
+                 "error": {"code": "project_not_found",
+                           "message": "No project with ID proj_x exists in your account"}},
+                {"index": 3, "status": "error", "error": {"code": "internal_error", "message": "boom"}},
+                {"index": 4, "status": "error", "error": {"code": "internal_error", "message": "boom"}},
+            ],
+        }
+        resp.raise_for_status = MagicMock()
+
+        migration = MigrationService(
+            api_url="https://example.com/api/v1",
+            api_key="memra_live_test123",
+        )
+
+        with patch("httpx.post", return_value=resp):
+            result = migration.migrate(
+                index=populated_svc.index,
+                store=populated_svc.store,
+                project_id="proj_x",
+            )
+
+        assert result.migrated == 2
+        assert result.failed == 3
+        assert any("No project with ID" in e for e in result.errors)

@@ -260,3 +260,53 @@ class TestMemoryServiceSupersede:
         assert chain[0]["content"] == "chain3 v1"
         assert chain[1]["content"] == "chain3 v2"
         assert chain[2]["content"] == "chain3 v3"
+
+    def test_supersede_revert_to_original_content(self, svc: MemoryService):
+        """A -> B -> back to A's content succeeds (dedup index is partial).
+
+        The dedup unique index must only cover non-superseded rows; otherwise
+        the superseded A row still holds the content_hash and the revert
+        raises sqlite3.IntegrityError.
+        """
+        a = _add_memory(svc, "the answer is A")
+        b_data, _ = svc.supersede(a["id"], "the answer is B")
+        reverted, _ = svc.supersede(b_data["id"], "the answer is A")
+
+        assert reverted["content"] == "the answer is A"
+        assert reverted["id"] != a["id"]
+        row = svc.index.get_by_id(reverted["id"])
+        assert row["status"] == "active"
+        # Full chain intact: A -> B -> A'
+        chain = svc.get_chain(reverted["id"])
+        assert [m["id"] for m in chain] == [a["id"], b_data["id"], reverted["id"]]
+
+
+# ---------------------------------------------------------------------------
+# Dedup index migration (legacy all-status unique index -> partial)
+# ---------------------------------------------------------------------------
+
+class TestDedupIndexMigration:
+    def test_initialize_migrates_legacy_dedup_index(self, svc: MemoryService):
+        """Re-opening a DB with the old all-status dedup index rebuilds it as partial."""
+        db_path = svc.index._db_path
+
+        # Simulate a legacy database: replace the partial index with the old
+        # all-status unique index.
+        svc.index._c.execute("DROP INDEX IF EXISTS idx_memories_dedup")
+        svc.index._c.execute(
+            """CREATE UNIQUE INDEX idx_memories_dedup
+               ON memories_index(namespace, tenant_id, content_hash)"""
+        )
+        svc.index._c.commit()
+        svc.index.close()
+
+        index = SQLiteIndex(db_path)
+        index.initialize()
+        try:
+            row = index._c.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_memories_dedup'"
+            ).fetchone()
+            assert row is not None
+            assert "WHERE" in row[0].upper()
+        finally:
+            index.close()

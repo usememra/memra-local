@@ -234,6 +234,110 @@ class TestPull:
         assert result.error is not None
         assert result.applied == 0
 
+    @staticmethod
+    def _mock_pull_response(events, cursor=1):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "events": events,
+            "cursor": cursor,
+            "has_more": False,
+        }
+        mock_response.raise_for_status = MagicMock()
+        return mock_response
+
+    def test_pull_create_preserves_remote_id(self, svc, sync):
+        """Applying a remote create must store the remote memory id locally."""
+        sync.enable("test-ns", api_key="memra_live_test123")
+        events = [
+            {
+                "event_id": "evt_1",
+                "event_type": "memory_created",
+                "memory_id": "mem_remote_xyz",
+                "payload": {
+                    "content": "remote memory",
+                    "type": "fact",
+                    "importance": 5,
+                    "project_id": "test-ns",
+                },
+            },
+        ]
+
+        with patch("httpx.get", return_value=self._mock_pull_response(events)):
+            result = sync.pull("test-ns", svc)
+
+        assert result.applied == 1
+        mem = svc.get("mem_remote_xyz")
+        assert mem is not None
+        assert mem["content"] == "remote memory"
+
+    def test_pull_create_update_delete_roundtrip_same_row(self, svc, sync):
+        """Remote create -> update -> delete must all land on the same local row.
+
+        Regression: pull used to mint a fresh local ULID on create, so the
+        follow-up update/delete events silently no-op'd while `applied` still
+        incremented.
+        """
+        sync.enable("test-ns", api_key="memra_live_test123")
+        events = [
+            {
+                "event_id": "evt_1",
+                "event_type": "memory_created",
+                "memory_id": "mem_remote_abc",
+                "payload": {
+                    "content": "remote v1",
+                    "type": "fact",
+                    "importance": 5,
+                    "project_id": "test-ns",
+                },
+            },
+            {
+                "event_id": "evt_2",
+                "event_type": "memory_updated",
+                "memory_id": "mem_remote_abc",
+                "payload": {"content": "remote v2"},
+            },
+            {
+                "event_id": "evt_3",
+                "event_type": "memory_deleted",
+                "memory_id": "mem_remote_abc",
+                "payload": {},
+            },
+        ]
+
+        with patch("httpx.get", return_value=self._mock_pull_response(events, cursor=3)):
+            result = sync.pull("test-ns", svc)
+
+        assert result.applied == 3
+        assert result.skipped == 0
+        # Deleted at the end of the sequence
+        assert svc.get("mem_remote_abc") is None
+
+    def test_pull_update_delete_without_target_count_skipped(self, svc, sync):
+        """update/delete events whose target is missing must count as skipped,
+        not applied."""
+        sync.enable("test-ns", api_key="memra_live_test123")
+        events = [
+            {
+                "event_id": "evt_1",
+                "event_type": "memory_updated",
+                "memory_id": "mem_missing",
+                "payload": {"content": "ghost"},
+            },
+            {
+                "event_id": "evt_2",
+                "event_type": "memory_deleted",
+                "memory_id": "mem_missing",
+                "payload": {},
+            },
+        ]
+
+        with patch("httpx.get", return_value=self._mock_pull_response(events)):
+            result = sync.pull("test-ns", svc)
+
+        assert result.applied == 0
+        assert result.skipped == 2
+
 
 # -------------------------------------------------------------------
 # Conflicts
@@ -339,3 +443,81 @@ class TestConflicts:
         assert original["content"] == "remote version"
         # Conflict sibling should be deleted
         assert svc.get(conflict_id) is None
+
+
+# -------------------------------------------------------------------
+# API key persistence
+# -------------------------------------------------------------------
+
+class TestApiKeyPersistence:
+    def test_api_key_loaded_by_new_service_instance(self, svc):
+        """enable() persists the key; a fresh SyncService (new process) loads it.
+
+        Without persistence the key only lived in the enabling process's
+        memory, so any CLI push/pull in another process sent an empty Bearer
+        token and always got a 401.
+        """
+        sync = svc.sync_service
+        sync.enable("my-ns", api_key="memra_live_persisted123")
+
+        creds_path = sync._credentials_path()
+        assert creds_path.exists()
+        # Secret material -- file must be owner-only
+        assert (creds_path.stat().st_mode & 0o777) == 0o600
+
+        fresh = SyncService(index=svc.index)
+        assert fresh._api_keys.get("my-ns") == "memra_live_persisted123"
+
+    def test_disable_removes_persisted_key(self, svc):
+        sync = svc.sync_service
+        sync.enable("my-ns", api_key="memra_live_persisted123")
+        sync.disable("my-ns")
+
+        fresh = SyncService(index=svc.index)
+        assert fresh._api_keys.get("my-ns") is None
+
+
+# -------------------------------------------------------------------
+# Account tier detection (reads GET /usage)
+# -------------------------------------------------------------------
+
+def _usage_response(tier):
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"tier": tier}
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
+class TestCheckAccountTier:
+    def test_reads_tier_from_usage_endpoint(self, sync):
+        sync.enable("my-ns", api_key="memra_live_test123", api_url="https://example.com/api/v1")
+        with patch("httpx.get", return_value=_usage_response("admin")) as mock_get:
+            assert sync.check_account_tier("my-ns") == "admin"
+        assert "/usage" in mock_get.call_args[0][0]
+
+    def test_result_is_cached(self, sync):
+        sync.enable("my-ns", api_key="memra_live_test123", api_url="https://example.com/api/v1")
+        with patch("httpx.get", return_value=_usage_response("team")) as mock_get:
+            assert sync.check_account_tier("my-ns") == "team"
+            assert sync.check_account_tier("my-ns") == "team"
+        mock_get.assert_called_once()  # second call served from cache
+
+    def test_unknown_namespace_returns_none(self, sync):
+        with patch("httpx.get") as mock_get:
+            assert sync.check_account_tier("never-enabled") is None
+        mock_get.assert_not_called()  # fail-closed before any network call
+
+    def test_http_error_is_fail_closed(self, sync):
+        sync.enable("my-ns", api_key="memra_live_test123", api_url="https://example.com/api/v1")
+        with patch("httpx.get", side_effect=httpx.ConnectError("refused")):
+            assert sync.check_account_tier("my-ns") is None
+
+    def test_missing_tier_field_returns_none(self, sync):
+        sync.enable("my-ns", api_key="memra_live_test123", api_url="https://example.com/api/v1")
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {}  # no tier key
+        resp.raise_for_status = MagicMock()
+        with patch("httpx.get", return_value=resp):
+            assert sync.check_account_tier("my-ns") is None

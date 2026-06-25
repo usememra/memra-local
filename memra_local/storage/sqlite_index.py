@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,6 +29,14 @@ class SQLiteIndex:
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
         self._conn: sqlite3.Connection | None = None
+        # Serializes all DB work on the shared connection. The connection is
+        # created with check_same_thread=False and FastAPI runs sync routes in
+        # a threadpool — without this lock, concurrent writes interleave
+        # transactions ("cannot start a transaction within a transaction")
+        # and permanently drift the index/FTS tables apart. RLock because
+        # some methods call other locked methods (e.g. update_by_id →
+        # get_by_id).
+        self._lock = threading.RLock()
 
     def initialize(self) -> None:
         """Create database, enable WAL mode, create tables and indexes."""
@@ -69,7 +78,8 @@ class SQLiteIndex:
                 ON memories_index(importance);
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_dedup
-                ON memories_index(namespace, tenant_id, content_hash);
+                ON memories_index(namespace, tenant_id, content_hash)
+                WHERE status != 'superseded';
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
                 USING fts5(id UNINDEXED, content, tokenize='porter unicode61');
@@ -101,6 +111,22 @@ class SQLiteIndex:
             );
         """)
         self._conn.commit()
+
+        # Migration: idx_memories_dedup must be partial (non-superseded rows
+        # only). The old all-status unique index rejected supersede reverts
+        # (A→B→A) with IntegrityError because the superseded A row still held
+        # the content_hash, while find_by_hash() excludes superseded rows.
+        dedup_sql = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_memories_dedup'"
+        ).fetchone()
+        if dedup_sql and dedup_sql[0] and "WHERE" not in dedup_sql[0].upper():
+            self._conn.execute("DROP INDEX IF EXISTS idx_memories_dedup")
+            self._conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_dedup
+                   ON memories_index(namespace, tenant_id, content_hash)
+                   WHERE status != 'superseded'"""
+            )
+            self._conn.commit()
 
         # Migration: add embedding BLOB column if not present
         cursor = self._conn.execute("PRAGMA table_info(memories_index)")
@@ -177,59 +203,63 @@ class SQLiteIndex:
         Raises:
             sqlite3.IntegrityError: If content_hash already exists for namespace+tenant_id
         """
-        self._c.execute(
-            """INSERT INTO memories_index
-               (id, namespace, tenant_id, type, importance, tags, content_hash,
-                source, metadata, storage_path, expires_at, confidence, status,
-                created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1.0, 'active', ?, ?)""",
-            (
-                memory_id,
-                namespace,
-                tenant_id,
-                type_,
-                importance,
-                json.dumps(tags),
-                content_hash,
-                source,
-                json.dumps(metadata) if metadata else None,
-                storage_path,
-                created_at,
-                updated_at,
-            ),
-        )
-        self._c.execute(
-            "INSERT INTO memories_fts (id, content) VALUES (?, ?)",
-            (memory_id, content),
-        )
-        self._c.commit()
+        with self._lock:
+            self._c.execute(
+                """INSERT INTO memories_index
+                   (id, namespace, tenant_id, type, importance, tags, content_hash,
+                    source, metadata, storage_path, expires_at, confidence, status,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1.0, 'active', ?, ?)""",
+                (
+                    memory_id,
+                    namespace,
+                    tenant_id,
+                    type_,
+                    importance,
+                    json.dumps(tags),
+                    content_hash,
+                    source,
+                    json.dumps(metadata) if metadata else None,
+                    storage_path,
+                    created_at,
+                    updated_at,
+                ),
+            )
+            self._c.execute(
+                "INSERT INTO memories_fts (id, content) VALUES (?, ?)",
+                (memory_id, content),
+            )
+            self._c.commit()
 
     def find_by_hash(
         self, namespace: str, tenant_id: str, content_hash: str
     ) -> dict | None:
         """Find a memory by its content hash within a namespace+tenant scope."""
-        row = self._c.execute(
-            """SELECT * FROM memories_index
-               WHERE namespace = ? AND tenant_id = ? AND content_hash = ?
-               AND status != 'superseded'""",
-            (namespace, tenant_id, content_hash),
-        ).fetchone()
+        with self._lock:
+            row = self._c.execute(
+                """SELECT * FROM memories_index
+                   WHERE namespace = ? AND tenant_id = ? AND content_hash = ?
+                   AND status != 'superseded'""",
+                (namespace, tenant_id, content_hash),
+            ).fetchone()
         return dict(row) if row else None
 
     def find_by_path(self, storage_path: str) -> dict | None:
         """Find an index entry by its storage_path."""
-        row = self._c.execute(
-            "SELECT * FROM memories_index WHERE storage_path = ?", (storage_path,)
-        ).fetchone()
+        with self._lock:
+            row = self._c.execute(
+                "SELECT * FROM memories_index WHERE storage_path = ?", (storage_path,)
+            ).fetchone()
         if row is None:
             return None
         return dict(row)
 
     def get_by_id(self, memory_id: str) -> dict | None:
         """Get a memory by its ID."""
-        row = self._c.execute(
-            "SELECT * FROM memories_index WHERE id = ?", (memory_id,)
-        ).fetchone()
+        with self._lock:
+            row = self._c.execute(
+                "SELECT * FROM memories_index WHERE id = ?", (memory_id,)
+            ).fetchone()
         return dict(row) if row else None
 
     def search_fts(
@@ -296,7 +326,8 @@ class SQLiteIndex:
             LIMIT ? OFFSET ?
         """
 
-        rows = self._c.execute(sql, params).fetchall()
+        with self._lock:
+            rows = self._c.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
     def list_memories(
@@ -307,8 +338,14 @@ class SQLiteIndex:
         limit: int = 50,
         offset: int = 0,
         include_superseded: bool = False,
+        order_by_importance: bool = False,
     ) -> tuple[list[dict], int]:
         """List memories with optional filters.
+
+        Args:
+            order_by_importance: If True, order by importance DESC (then
+                created_at DESC) so LIMIT keeps the most important rows
+                (used by bootstrap). Default orders by created_at DESC.
 
         Returns:
             Tuple of (rows, total_count)
@@ -329,21 +366,28 @@ class SQLiteIndex:
             conditions.append("type = ?")
             params.append(type_)
 
-        where = "WHERE " + " AND ".join(conditions)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
-        # Count total
-        count_row = self._c.execute(
-            f"SELECT COUNT(*) FROM memories_index {where}", params
-        ).fetchone()
-        total = count_row[0]
+        order_by = (
+            "importance DESC, created_at DESC"
+            if order_by_importance
+            else "created_at DESC"
+        )
 
-        # Fetch page
-        rows = self._c.execute(
-            f"""SELECT * FROM memories_index {where}
-                ORDER BY created_at DESC
-                LIMIT ? OFFSET ?""",
-            params + [limit, offset],
-        ).fetchall()
+        with self._lock:
+            # Count total
+            count_row = self._c.execute(
+                f"SELECT COUNT(*) FROM memories_index {where}", params
+            ).fetchone()
+            total = count_row[0]
+
+            # Fetch page
+            rows = self._c.execute(
+                f"""SELECT * FROM memories_index {where}
+                    ORDER BY {order_by}
+                    LIMIT ? OFFSET ?""",
+                params + [limit, offset],
+            ).fetchall()
 
         return [dict(r) for r in rows], total
 
@@ -353,11 +397,12 @@ class SQLiteIndex:
         Returns:
             True if a row was deleted, False if not found
         """
-        cursor = self._c.execute(
-            "DELETE FROM memories_index WHERE id = ?", (memory_id,)
-        )
-        self._c.execute("DELETE FROM memories_fts WHERE id = ?", (memory_id,))
-        self._c.commit()
+        with self._lock:
+            cursor = self._c.execute(
+                "DELETE FROM memories_index WHERE id = ?", (memory_id,)
+            )
+            self._c.execute("DELETE FROM memories_fts WHERE id = ?", (memory_id,))
+            self._c.commit()
         return cursor.rowcount > 0
 
     def update_by_id(self, memory_id: str, updates: dict) -> dict | None:
@@ -383,12 +428,13 @@ class SQLiteIndex:
                 params.append(val)
         params.append(memory_id)
 
-        self._c.execute(
-            f"UPDATE memories_index SET {', '.join(set_clauses)} WHERE id = ?",
-            params,
-        )
-        self._c.commit()
-        return self.get_by_id(memory_id)
+        with self._lock:
+            self._c.execute(
+                f"UPDATE memories_index SET {', '.join(set_clauses)} WHERE id = ?",
+                params,
+            )
+            self._c.commit()
+            return self.get_by_id(memory_id)
 
     def insert_with_embedding(
         self,
@@ -406,39 +452,49 @@ class SQLiteIndex:
         created_at: str,
         updated_at: str,
         embedding: bytes | None = None,
+        status: str = "active",
+        superseded_by: str | None = None,
     ) -> None:
         """Insert a memory into the index with optional embedding BLOB.
+
+        ``status`` and ``superseded_by`` default to a fresh active memory but
+        can be supplied to preserve lifecycle state (e.g. `memra reindex`
+        rebuilding the index from flat files must not resurrect superseded
+        memories or sever supersession chains).
 
         Raises:
             sqlite3.IntegrityError: If content_hash already exists for namespace+tenant_id
         """
-        self._c.execute(
-            """INSERT INTO memories_index
-               (id, namespace, tenant_id, type, importance, tags, content_hash,
-                source, metadata, storage_path, expires_at, confidence, status,
-                created_at, updated_at, embedding)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1.0, 'active', ?, ?, ?)""",
-            (
-                memory_id,
-                namespace,
-                tenant_id,
-                type_,
-                importance,
-                json.dumps(tags),
-                content_hash,
-                source,
-                json.dumps(metadata) if metadata else None,
-                storage_path,
-                created_at,
-                updated_at,
-                embedding,
-            ),
-        )
-        self._c.execute(
-            "INSERT INTO memories_fts (id, content) VALUES (?, ?)",
-            (memory_id, content),
-        )
-        self._c.commit()
+        with self._lock:
+            self._c.execute(
+                """INSERT INTO memories_index
+                   (id, namespace, tenant_id, type, importance, tags, content_hash,
+                    source, metadata, storage_path, expires_at, confidence, status,
+                    superseded_by, created_at, updated_at, embedding)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1.0, ?, ?, ?, ?, ?)""",
+                (
+                    memory_id,
+                    namespace,
+                    tenant_id,
+                    type_,
+                    importance,
+                    json.dumps(tags),
+                    content_hash,
+                    source,
+                    json.dumps(metadata) if metadata else None,
+                    storage_path,
+                    status,
+                    superseded_by,
+                    created_at,
+                    updated_at,
+                    embedding,
+                ),
+            )
+            self._c.execute(
+                "INSERT INTO memories_fts (id, content) VALUES (?, ?)",
+                (memory_id, content),
+            )
+            self._c.commit()
 
     def get_candidates_with_embeddings(
         self,
@@ -491,10 +547,11 @@ class SQLiteIndex:
         where = " AND ".join(conditions)
         params.append(limit)
 
-        rows = self._c.execute(
-            f"SELECT * FROM memories_index WHERE {where} LIMIT ?",
-            params,
-        ).fetchall()
+        with self._lock:
+            rows = self._c.execute(
+                f"SELECT * FROM memories_index WHERE {where} LIMIT ?",
+                params,
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def update_embedding(self, memory_id: str, embedding: bytes) -> None:
@@ -504,11 +561,12 @@ class SQLiteIndex:
             memory_id: The memory to update
             embedding: Serialized embedding bytes (wrapped in sqlite3.Binary)
         """
-        self._c.execute(
-            "UPDATE memories_index SET embedding = ? WHERE id = ?",
-            (embedding, memory_id),
-        )
-        self._c.commit()
+        with self._lock:
+            self._c.execute(
+                "UPDATE memories_index SET embedding = ? WHERE id = ?",
+                (embedding, memory_id),
+            )
+            self._c.commit()
 
     def supersede_by_id(
         self, old_id: str, new_id: str, expected_revision: int
@@ -524,14 +582,15 @@ class SQLiteIndex:
             Number of rows updated (0 = version conflict, 1 = success)
         """
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        cursor = self._c.execute(
-            """UPDATE memories_index
-               SET superseded_by = ?, status = 'superseded',
-                   revision = revision + 1, updated_at = ?
-               WHERE id = ? AND revision = ?""",
-            (new_id, now, old_id, expected_revision),
-        )
-        self._c.commit()
+        with self._lock:
+            cursor = self._c.execute(
+                """UPDATE memories_index
+                   SET superseded_by = ?, status = 'superseded',
+                       revision = revision + 1, updated_at = ?
+                   WHERE id = ? AND revision = ?""",
+                (new_id, now, old_id, expected_revision),
+            )
+            self._c.commit()
         return cursor.rowcount
 
     def get_chain_rows(self, memory_id: str) -> list[dict]:
@@ -548,8 +607,9 @@ class SQLiteIndex:
         # anchor row, then join to memories_index and order oldest→newest.
         # One query, no per-row get_by_id loop — required for SC-5 (10K chain
         # returns in <100ms).
-        rows = self._c.execute(
-            """
+        with self._lock:
+            rows = self._c.execute(
+                """
             WITH RECURSIVE
               ancestors(id, depth) AS (
                 SELECT id, 0 FROM memories_index WHERE id = :mid
@@ -576,8 +636,8 @@ class SQLiteIndex:
             ) chain ON chain.id = mi.id
             ORDER BY chain.pos
             """,
-            {"mid": memory_id},
-        ).fetchall()
+                {"mid": memory_id},
+            ).fetchall()
 
         return [dict(r) for r in rows]
 
@@ -607,15 +667,17 @@ class SQLiteIndex:
                 params.append(val)
         params.extend([memory_id, expected_revision])
 
-        cursor = self._c.execute(
-            f"UPDATE memories_index SET {', '.join(set_clauses)} WHERE id = ? AND revision = ?",
-            params,
-        )
-        self._c.commit()
+        with self._lock:
+            cursor = self._c.execute(
+                f"UPDATE memories_index SET {', '.join(set_clauses)} WHERE id = ? AND revision = ?",
+                params,
+            )
+            self._c.commit()
         return cursor.rowcount
 
     def close(self) -> None:
         """Close the database connection."""
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None

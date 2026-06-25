@@ -346,6 +346,10 @@ def reindex(embeddings: bool, scope: str):
                 created_at=data.get("created_at", now),
                 updated_at=data.get("updated_at", now),
                 embedding=embedding_blob,
+                # Preserve lifecycle state from the flat file -- without this,
+                # reindex resurrects superseded memories and severs chains.
+                status=data.get("status", "active"),
+                superseded_by=data.get("superseded_by"),
             )
             count += 1
         except Exception as e:
@@ -565,9 +569,10 @@ def sync_set_mode(namespace, mode, allow_raw_pii, scope):
 @click.argument("direction", type=click.Choice(["local->cloud"]))
 @click.option("--api-key", envvar="MEMRA_API_KEY", help="Cloud API key (or set MEMRA_API_KEY)")
 @click.option("--api-url", default="https://usememra.com/api/v1", show_default=True, help="Cloud API URL")
+@click.option("--project-id", required=True, help="Target cloud project ID (proj_...) to migrate into")
 @click.option("--dry-run", is_flag=True, help="Show what would be migrated without uploading")
 @click.option("--scope", type=click.Choice(["global", "project", "auto"]), default="auto")
-def migrate(direction, api_key, api_url, dry_run, scope):
+def migrate(direction, api_key, api_url, project_id, dry_run, scope):
     """Migrate memories between local and cloud."""
     if not api_key:
         api_key = click.prompt("Cloud API key", hide_input=True)
@@ -590,6 +595,7 @@ def migrate(direction, api_key, api_url, dry_run, scope):
     result = migration_svc.migrate(
         index=svc.index,
         store=svc.store,
+        project_id=project_id,
         dry_run=dry_run,
         progress_callback=progress,
     )

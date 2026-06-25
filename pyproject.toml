@@ -1,6 +1,6 @@
 [project]
 name = "memra-local"
-version = "0.3.1"
+version = "0.3.2"
 description = "Local memory server for AI agents — offline, private, fast"
 readme = "README.md"
 requires-python = ">=3.10"

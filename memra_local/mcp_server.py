@@ -342,11 +342,38 @@ def memra_history(memory_id: str) -> dict:
 # Tool: memra_sync_enable
 # ------------------------------------------------------------------
 @mcp_app.tool()
-def memra_sync_enable(namespace: str, api_key: str, api_url: str = "https://usememra.com/api/v1") -> dict:
-    """Enable cloud sync for a namespace."""
+def memra_sync_enable(
+    namespace: str,
+    api_key: str,
+    api_url: str = "https://usememra.com/api/v1",
+    mode: str = "local_private",
+) -> dict:
+    """Enable cloud sync for a namespace.
+
+    Args:
+        mode: PII sharing mode. One of 'local_private' (default — pull-only,
+            push is disabled), 'shared_masked' (content is PII-masked before
+            push), or 'shared_raw' (raw content; requires Team/Admin tier).
+    """
+    from memra_local.services.sync_service import SyncService
+
     svc = _get_service()
-    svc.sync_service.enable(namespace, api_key, api_url)
-    return {"status": "enabled", "namespace": namespace}
+    if mode not in SyncService.VALID_PII_MODES:
+        return {
+            "error": (
+                f"Invalid mode '{mode}'. "
+                f"Valid modes: {', '.join(SyncService.VALID_PII_MODES)}"
+            )
+        }
+    svc.sync_service.enable(namespace, api_key, api_url, pii_mode=mode)
+    result = {"status": "enabled", "namespace": namespace, "mode": mode}
+    if mode == "local_private":
+        result["note"] = (
+            "Push is disabled in local_private mode (pull-only). "
+            "Re-run memra_sync_enable with mode='shared_masked' or "
+            "mode='shared_raw' to allow pushing."
+        )
+    return result
 
 
 # ------------------------------------------------------------------

@@ -323,3 +323,61 @@ class TestUpdateEmbedding:
         assert row["embedding"] is not None
         restored = np.frombuffer(row["embedding"], dtype=np.float32)
         assert np.allclose(restored, np.ones(384, dtype=np.float32))
+
+
+# ---------------------------------------------------------------------------
+# Recall: FTS fallback when the embedding model fails to load
+# ---------------------------------------------------------------------------
+
+class _StubEmbedding:
+    """Minimal embedder that works for add(); recall encode is broken by the test."""
+
+    def encode(self, text):
+        vec = np.ones(8, dtype=np.float32)
+        return vec / np.linalg.norm(vec)
+
+    @staticmethod
+    def serialize(embedding):
+        return embedding.astype(np.float32).tobytes()
+
+    @staticmethod
+    def deserialize(blob):
+        return np.frombuffer(blob, dtype=np.float32)
+
+    @staticmethod
+    def cosine_similarity(query, candidates):
+        return candidates @ query
+
+
+class TestRecallEmbeddingFallback:
+    """recall() promises FTS fallback in its docstring — a model-load failure
+    (e.g. fastembed cache wiped while offline) must not propagate."""
+
+    @pytest.fixture
+    def svc(self, tmp_storage: Path):
+        from memra_local.services.memory_service import MemoryService
+        from memra_local.storage.flat_file import FlatFileStore
+
+        store = FlatFileStore(tmp_storage)
+        index = SQLiteIndex(tmp_storage / "index.db")
+        index.initialize()
+        service = MemoryService(store, index, embedding_service=_StubEmbedding())
+        yield service
+        index.close()
+
+    def test_recall_falls_back_to_fts_when_embedder_raises(self, svc, monkeypatch):
+        svc.add({
+            "content": "Python is a programming language",
+            "tenant_id": "local",
+            "project_id": "default",
+        })
+
+        def boom(text):
+            raise RuntimeError("model download failed: offline and cache missing")
+
+        monkeypatch.setattr(svc.embedding_service, "encode", boom)
+
+        results, meta = svc.recall("programming", "default", "local")
+        assert meta["scoring"] == "text_match"
+        assert len(results) == 1
+        assert results[0]["content"] == "Python is a programming language"

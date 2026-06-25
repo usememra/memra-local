@@ -38,6 +38,10 @@ class SyncService:
         # Cache of enabled namespaces for fast is_sync_enabled checks
         self._enabled_cache: set[str] = set()
         self._cache_loaded = False
+        # Per-namespace API keys, loaded from disk so push/pull in a fresh
+        # process (e.g. `memra sync push` after `memra sync enable`) can
+        # authenticate. Persisted by enable().
+        self._api_keys: dict[str, str] = self._load_api_keys()
 
     def _load_cache(self) -> None:
         """Load enabled namespaces into memory cache."""
@@ -49,6 +53,43 @@ class SyncService:
         except Exception:
             self._enabled_cache = set()
         self._cache_loaded = True
+
+    # ------------------------------------------------------------------
+    # API key persistence
+    # ------------------------------------------------------------------
+
+    def _credentials_path(self) -> Path:
+        """Return path to ~/.memra/credentials.json (tests patch this method)."""
+        return Path.home() / ".memra" / "credentials.json"
+
+    def _load_api_keys(self) -> dict[str, str]:
+        """Load persisted per-namespace API keys. Returns {} on any failure."""
+        path = self._credentials_path()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) or {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {ns: key for ns, key in data.items() if isinstance(key, str)}
+
+    def _persist_api_keys(self) -> None:
+        """Write per-namespace API keys to disk with mode 0600 (secret material).
+
+        Without persistence the key only lives in this process's memory — a
+        push/pull from another process would send an empty Bearer token and
+        always get a 401.
+        """
+        path = self._credentials_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self._api_keys, f)
+        except OSError as exc:
+            logger.warning("Failed to persist sync API keys: %s", exc)
 
     # ------------------------------------------------------------------
     # Enable / Disable
@@ -77,10 +118,10 @@ class SyncService:
         )
         self._conn.commit()
         self._enabled_cache.add(namespace)
-        # Store API key per-namespace (in memory for this session)
-        if not hasattr(self, "_api_keys"):
-            self._api_keys: dict[str, str] = {}
+        # Store API key per-namespace and persist it so push/pull from other
+        # processes (CLI) can authenticate.
         self._api_keys[namespace] = api_key
+        self._persist_api_keys()
 
     def disable(self, namespace: str) -> bool:
         """Disable sync for a namespace."""
@@ -89,6 +130,8 @@ class SyncService:
         )
         self._conn.commit()
         self._enabled_cache.discard(namespace)
+        if self._api_keys.pop(namespace, None) is not None:
+            self._persist_api_keys()
         return cursor.rowcount > 0
 
     def is_sync_enabled(self, namespace: str) -> bool:
@@ -121,25 +164,45 @@ class SyncService:
     def check_account_tier(self, namespace: str) -> str | None:
         """Return the account tier for a synced namespace, or None if unknown.
 
-        Historical note (Phase 77-03): this used to issue a GET against a phantom
-        account endpoint, but no such route exists on the cloud API — the call
-        always 404'd. The cloud ``/v1/agents/{id}/bootstrap`` response also does
-        not surface tier or quota, so there is no alternate source on v1.0.
+        Reads the tier from the cloud ``GET /usage`` endpoint — the only v1 route
+        that surfaces it (it returns a top-level ``tier`` string). Result is
+        cached per namespace for the process lifetime.
 
-        Returning ``None`` is fail-closed: the only caller that gates on the tier
-        value (``shared_raw`` push mode) rejects any non-{team,admin} result, so
-        an unknown tier still blocks raw-PII uploads. When the cloud exposes tier
-        information in a future release, wire it in here.
+        Fail-closed: a namespace that isn't sync-enabled, a missing API key, any
+        network/HTTP error, or a response without a usable ``tier`` all return
+        ``None``. The only caller that gates on this value (``shared_raw`` push)
+        rejects any non-{team,admin} result, so an unknown tier still blocks
+        raw-PII uploads.
         """
-        # No cloud endpoint exposes tier in v1.0 — always fail-closed.
-        # When a tier/quota endpoint lands, populate self._tier_cache here
-        # and return the cached value.
+        if namespace in self._tier_cache:
+            return self._tier_cache[namespace]
+
         config = self._conn.execute(
-            "SELECT 1 FROM sync_cursors WHERE namespace = ?", (namespace,)
+            "SELECT cloud_api_url FROM sync_cursors WHERE namespace = ?", (namespace,)
         ).fetchone()
         if config is None:
             return None
-        return None  # explicit: no source for tier yet
+
+        api_url = config["cloud_api_url"]
+        api_key = getattr(self, "_api_keys", {}).get(namespace, self._api_key or "")
+        if not api_key:
+            return None
+
+        try:
+            response = httpx.get(
+                f"{api_url}/usage",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            tier = response.json().get("tier")
+        except (httpx.HTTPError, ValueError):
+            return None
+
+        if isinstance(tier, str) and tier:
+            self._tier_cache[namespace] = tier
+            return tier
+        return None
 
     def _mask_event_payloads(self, events: list[dict], namespace: str) -> list[dict] | None:
         """Mask PII in event payloads for shared_masked mode.
@@ -339,6 +402,7 @@ class SyncService:
 
                 events = data.get("events", [])
                 applied = 0
+                skipped = 0
 
                 for event in events:
                     event_type = event.get("event_type", "")
@@ -346,7 +410,10 @@ class SyncService:
 
                     try:
                         if event_type == "memory_created":
+                            # Preserve the remote memory id as the local id so
+                            # later remote update/delete events find their row.
                             memory_service.add({
+                                "id": event.get("memory_id") or None,
                                 "content": payload.get("content", ""),
                                 "project_id": payload.get("project_id", namespace),
                                 "type": payload.get("type", "fact"),
@@ -358,15 +425,26 @@ class SyncService:
                             applied += 1
                         elif event_type == "memory_updated":
                             memory_id = event.get("memory_id", "")
-                            if memory_id:
-                                memory_service.update(memory_id, payload)
+                            if memory_id and memory_service.update(memory_id, payload) is not None:
                                 applied += 1
+                            else:
+                                skipped += 1
+                                logger.warning(
+                                    "Skipped event %s: memory %s not found locally",
+                                    event.get("event_id"), memory_id,
+                                )
                         elif event_type == "memory_deleted":
                             memory_id = event.get("memory_id", "")
-                            if memory_id:
-                                memory_service.delete(memory_id)
+                            if memory_id and memory_service.delete(memory_id):
                                 applied += 1
+                            else:
+                                skipped += 1
+                                logger.warning(
+                                    "Skipped event %s: memory %s not found locally",
+                                    event.get("event_id"), memory_id,
+                                )
                     except Exception as exc:
+                        skipped += 1
                         logger.warning("Failed to apply event %s: %s", event.get("event_id"), exc)
 
                 # Update cursor after successful apply
@@ -380,6 +458,7 @@ class SyncService:
 
                 return SyncPullResult(
                     applied=applied,
+                    skipped=skipped,
                     cursor=new_cursor,
                     has_more=data.get("has_more", False),
                 )

@@ -41,6 +41,7 @@ class MigrationService:
         self,
         index: SQLiteIndex,
         store: FlatFileStore,
+        project_id: str,
         dry_run: bool = False,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> MigrateResult:
@@ -49,6 +50,11 @@ class MigrationService:
         Args:
             index: SQLite index to read memory metadata from.
             store: Flat file store to read memory content from.
+            project_id: Target cloud project ID (proj_...) every memory is
+                migrated into. The cloud batch endpoint requires an existing
+                project; a local namespace is not a valid cloud project ID, so
+                the caller must supply a real one. Each memory's local namespace
+                is preserved as its cloud ``tenant_id``.
             dry_run: If True, count memories without uploading.
             progress_callback: Called with (migrated_so_far, total) after each batch.
 
@@ -92,7 +98,8 @@ class MigrationService:
                 "tags": tags,
                 "source": row.get("source"),
                 "metadata": metadata,
-                "project_id": row.get("namespace", "default"),
+                "tenant_id": row.get("namespace", "default"),
+                "project_id": project_id,
             }
             memories.append(memory)
 
@@ -131,10 +138,23 @@ class MigrationService:
                 )
                 response.raise_for_status()
                 data = response.json()
-                batch_created = data.get("created", 0)
-                batch_duplicates = data.get("duplicates", 0)
-                migrated += batch_created
-                skipped += batch_duplicates
+                migrated += data.get("created", 0)
+                skipped += data.get("duplicates", 0)
+                # 207 Multi-Status: raise_for_status() does not raise on 2xx, so
+                # per-item failures (e.g. "No project with ID X exists") would be
+                # silently dropped, reproducing the "0 migrated, no error" pain.
+                # Count them and surface the first message.
+                batch_errors = data.get("errors", 0)
+                if batch_errors:
+                    failed += batch_errors
+                    first = next(
+                        (r.get("error", {}).get("message")
+                         for r in data.get("results", [])
+                         if r.get("status") not in ("created", "duplicate")),
+                        None,
+                    )
+                    if first:
+                        errors.append(first)
             except Exception as exc:
                 failed += len(batch)
                 errors.append(f"Batch upload failed: {exc}")

@@ -153,6 +153,32 @@ class TestReindexCommand:
         assert "Reindexed" in result.output
         assert "2" in result.output
 
+    def test_reindex_preserves_superseded_status_and_chain(self, runner, tmp_storage):
+        """Reindex must not resurrect superseded memories or sever chains."""
+        with _patch_factory(tmp_storage):
+            svc = create_service(scope="global", storage_dir=tmp_storage)
+            old, _ = svc.add({"content": "version one", "project_id": "default"})
+            new_data, _ = svc.supersede(old["id"], "version two")
+
+            result = runner.invoke(cli, ["reindex"])
+            assert result.exit_code == 0
+            assert "Reindexed 2" in result.output
+
+            svc = create_service(scope="global", storage_dir=tmp_storage)
+            old_row = svc.index.get_by_id(old["id"])
+            assert old_row["status"] == "superseded"
+            assert old_row["superseded_by"] == new_data["id"]
+
+            # Superseded memory must stay out of active recall
+            results = svc.search("version", "default", "local")
+            ids = [r["id"] for r in results]
+            assert old["id"] not in ids
+            assert new_data["id"] in ids
+
+            # Chain intact after reindex
+            chain = svc.get_chain(new_data["id"])
+            assert [m["id"] for m in chain] == [old["id"], new_data["id"]]
+
 
 # -------------------------------------------------------------------
 # memra doctor
@@ -314,7 +340,8 @@ class TestMigrateCommand:
 
             result = runner.invoke(
                 cli,
-                ["migrate", "local->cloud", "--api-key", "memra_live_test", "--dry-run"],
+                ["migrate", "local->cloud", "--api-key", "memra_live_test",
+                 "--project-id", "proj_test", "--dry-run"],
             )
         assert result.exit_code == 0
         assert "Dry run" in result.output
@@ -350,7 +377,8 @@ class TestMigrateCommand:
             with patch("httpx.post", side_effect=route_post):
                 result = runner.invoke(
                     cli,
-                    ["migrate", "local->cloud", "--api-key", "memra_live_test"],
+                    ["migrate", "local->cloud", "--api-key", "memra_live_test",
+                     "--project-id", "proj_test"],
                 )
         assert result.exit_code == 0
         assert "Migration complete" in result.output
@@ -415,7 +443,8 @@ class TestMigrateCommand:
 
             result = runner.invoke(
                 cli,
-                ["migrate", "local->cloud", "--api-key", "memra_live_test", "--dry-run"],
+                ["migrate", "local->cloud", "--api-key", "memra_live_test",
+                 "--project-id", "proj_test", "--dry-run"],
             )
         assert result.exit_code == 0
         assert "Dry run" in result.output
@@ -447,7 +476,7 @@ class TestMigrateCommand:
             with patch("httpx.post", side_effect=route_post):
                 result = runner.invoke(
                     cli,
-                    ["migrate", "local->cloud"],
+                    ["migrate", "local->cloud", "--project-id", "proj_test"],
                     env={"MEMRA_API_KEY": "memra_live_from_env"},
                 )
         assert result.exit_code == 0

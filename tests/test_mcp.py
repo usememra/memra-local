@@ -253,6 +253,47 @@ class TestMCPToolFunctionality:
         assert result["status"] == "enabled"
         assert result["namespace"] == "test-sync-ns"
 
+    def test_memra_sync_enable_default_mode_states_push_disabled(self):
+        """Default local_private mode must be visible and explain that push
+        is disabled — otherwise the tool is a silent dead-end."""
+        from memra_local.mcp_server import memra_sync_enable
+
+        result = memra_sync_enable(
+            namespace="test-sync-default-mode",
+            api_key="memra_live_test123",
+        )
+        assert result["mode"] == "local_private"
+        assert "push" in result["note"].lower()
+        assert "shared_masked" in result["note"]
+
+    def test_memra_sync_enable_with_mode(self):
+        import memra_local.mcp_server as mcp_mod
+        from memra_local.mcp_server import memra_sync_enable
+
+        result = memra_sync_enable(
+            namespace="test-sync-masked",
+            api_key="memra_live_test123",
+            mode="shared_masked",
+        )
+        assert result["status"] == "enabled"
+        assert result["mode"] == "shared_masked"
+        assert "note" not in result
+        sync = mcp_mod._service.sync_service
+        assert sync.get_mode("test-sync-masked") == "shared_masked"
+
+    def test_memra_sync_enable_rejects_invalid_mode(self):
+        import memra_local.mcp_server as mcp_mod
+        from memra_local.mcp_server import memra_sync_enable
+
+        result = memra_sync_enable(
+            namespace="test-sync-bad-mode",
+            api_key="memra_live_test123",
+            mode="bogus",
+        )
+        assert "error" in result
+        sync = mcp_mod._service.sync_service
+        assert sync.is_sync_enabled("test-sync-bad-mode") is False
+
     # --------------------------------------------------------------
     # v4.3 canonical verbs: memra_remember + memra_recall
     # --------------------------------------------------------------

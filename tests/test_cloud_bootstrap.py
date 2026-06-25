@@ -267,3 +267,27 @@ class TestMissingAgentId:
 
         mock_get.assert_not_called()
         assert any(m["content"] == "local only" for m in results)
+
+
+# -------------------------------------------------------------------
+# Test 5: Importance ordering happens in SQL, before LIMIT
+# -------------------------------------------------------------------
+
+class TestBootstrapImportanceOrdering:
+    def test_old_high_importance_memory_survives_limit(self, svc):
+        """An importance-10 memory older than 30 importance-1 rows must be in
+        bootstrap. Regression: the index query ordered by created_at DESC and
+        applied LIMIT before the importance sort, dropping old important rows.
+        """
+        top = _add_local(svc, "critical old fact", importance=10)
+        # Make it strictly older than all the noise rows
+        svc.index.update_by_id(top["id"], {"created_at": "2020-01-01T00:00:00Z"})
+
+        for i in range(30):
+            _add_local(svc, f"low-importance noise {i}", importance=1)
+
+        results = svc.bootstrap("proj_x", "local")  # default limit=20
+        ids = [m["id"] for m in results]
+        assert top["id"] in ids
+        # Highest importance comes first
+        assert results[0]["id"] == top["id"]

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import shutil
+import sqlite3
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -112,3 +114,75 @@ class TestMemoryServiceLocking:
         mem = _add_memory(svc, "revision conflict test")
         with pytest.raises(ConcurrentModificationError):
             svc.update(mem["id"], {"importance": 8}, expected_revision=999)
+
+
+class TestUpdateIndexFirst:
+    """update() must apply the index update (dedup/revision checks) BEFORE
+    writing the flat file — a rejected update must leave the file untouched,
+    otherwise file and index drift apart."""
+
+    def test_version_conflict_leaves_flat_file_untouched(self, svc: MemoryService):
+        mem = _add_memory(svc, "original content")
+        row = svc.index.get_by_id(mem["id"])
+
+        with pytest.raises(ConcurrentModificationError):
+            svc.update(mem["id"], {"content": "drifted content"}, expected_revision=999)
+
+        on_disk = svc.store.read(row["storage_path"])
+        assert on_disk["content"] == "original content"
+
+    def test_dedup_conflict_leaves_flat_file_untouched(self, svc: MemoryService):
+        """Updating B's content to duplicate A's violates the dedup unique
+        index — the flat file for B must keep its original content."""
+        _add_memory(svc, "content a")
+        mem_b = _add_memory(svc, "content b")
+        row_b = svc.index.get_by_id(mem_b["id"])
+
+        with pytest.raises(sqlite3.IntegrityError):
+            svc.update(mem_b["id"], {"content": "content a"})
+
+        on_disk = svc.store.read(row_b["storage_path"])
+        assert on_disk["content"] == "content b"
+
+
+class TestThreadSafety:
+    def test_concurrent_adds_keep_index_and_fts_consistent(self, svc: MemoryService):
+        """4 threads x 25 adds on the shared connection: no errors, no FTS drift.
+
+        Regression test for the unlocked shared SQLite connection: concurrent
+        writes interleaved transactions ("cannot start a transaction within a
+        transaction") and left memories_index and memories_fts permanently out
+        of sync, making memories invisible to text search.
+        """
+        errors: list[Exception] = []
+
+        def worker(worker_id: int) -> None:
+            for i in range(25):
+                try:
+                    svc.add(
+                        {
+                            "content": f"concurrent memory worker{worker_id} item{i}",
+                            "tenant_id": "local",
+                            "project_id": "default",
+                        }
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(w,)) for w in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+
+        with svc.index._lock:
+            index_count = svc.index._c.execute(
+                "SELECT COUNT(*) FROM memories_index"
+            ).fetchone()[0]
+            fts_count = svc.index._c.execute(
+                "SELECT COUNT(*) FROM memories_fts"
+            ).fetchone()[0]
+        assert index_count == 100
+        assert fts_count == index_count
